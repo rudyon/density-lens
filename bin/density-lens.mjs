@@ -210,17 +210,8 @@ function assertNoDensityCycles(id, sources, visiting = [], visited = new Set()) 
   visited.add(id);
 }
 
-function hashId(id) {
-  let hash = 2166136261n;
-  for (const char of id)
-    hash = BigInt.asIntN(
-      64,
-      (hash ^ BigInt(char.codePointAt(0))) * 1099511628211n,
-    );
-  return hash;
-}
-
 function bindNoise(density, seed, activeReferences = new Set()) {
+  const positionalRandom = XoroshiroRandom.create(seed).forkPositional();
   return density.mapAll({
     apply(node) {
       if (node instanceof DensityFunction.HolderHolder) {
@@ -237,7 +228,7 @@ function bindNoise(density, seed, activeReferences = new Set()) {
       const key = node.noise.key()?.toString() ?? "minecraft:anonymous";
       const sampler = node.noise
         .value()
-        .create(XoroshiroRandom.create(seed ^ hashId(key)));
+        .create(positionalRandom.fromHashOf(key));
       return new DensityFunction.NoiseFunction(
         node.noise,
         node.xzScale,
@@ -251,11 +242,51 @@ function bindNoise(density, seed, activeReferences = new Set()) {
   });
 }
 
+function createGradientHeightModel(density, options) {
+  if (!(density instanceof DensityFunction.Binary) || !["add", "sub"].includes(density.type)) return null;
+  let base;
+  let gradient;
+  let baseSign;
+  let gradientSign;
+  if (density.left instanceof DensityFunction.Gradient && density.left.axis === "y" && density.left.tiling === "clamp_to_edge") {
+    gradient = density.left;
+    base = density.right;
+    baseSign = density.type === "add" ? 1 : -1;
+    gradientSign = 1;
+  } else if (density.right instanceof DensityFunction.Gradient && density.right.axis === "y" && density.right.tiling === "clamp_to_edge") {
+    gradient = density.right;
+    base = density.left;
+    baseSign = 1;
+    gradientSign = density.type === "add" ? 1 : -1;
+  } else {
+    return null;
+  }
+  const sample = (y) => base.compute({ x: 0, y, z: 0 });
+  if (sample(options.minY) !== sample(options.maxY)) return null;
+  return (x, z) => {
+    const baseValue = base.compute({ x, y: 0, z });
+    const evaluate = (y) => baseSign * baseValue + gradientSign * gradient.compute({ x, y, z });
+    const lowValue = evaluate(options.minY);
+    const highValue = evaluate(options.maxY);
+    if (highValue > options.threshold) return { value: options.maxY, hit: true };
+    if (lowValue <= options.threshold) return { value: options.minY, hit: false };
+    let low = options.minY;
+    let high = options.maxY;
+    while (high - low > 1) {
+      const candidate = Math.floor((low + high) / 2);
+      if (evaluate(candidate) > options.threshold) low = candidate;
+      else high = candidate;
+    }
+    return { value: low, hit: true };
+  };
+}
+
 function render(density, options) {
   const values = new Float64Array(options.width * options.height);
   let min = Infinity;
   let max = -Infinity;
   let surfaceHits = 0;
+  const gradientHeightModel = options.mode === "density" ? createGradientHeightModel(density, options) : null;
   for (let row = 0; row < options.height; row += 1) {
     for (let column = 0; column < options.width; column += 1) {
       const x =
@@ -265,6 +296,10 @@ function render(density, options) {
       let value;
       if (options.mode === "noise") {
         value = density.compute({ x, y: options.y, z });
+      } else if (gradientHeightModel) {
+        const result = gradientHeightModel(x, z);
+        value = result.value;
+        if (result.hit) surfaceHits += 1;
       } else {
         const bottom = density.compute({ x, y: options.minY, z });
         const middleY = Math.floor((options.minY + options.maxY) / 2);
@@ -273,6 +308,21 @@ function render(density, options) {
         if (bottom === middle && middle === top) {
           value = top > options.threshold ? options.maxY : options.minY;
           if (top > options.threshold) surfaceHits += 1;
+        } else if (
+          bottom > options.threshold &&
+          top <= options.threshold &&
+          bottom >= middle &&
+          middle >= top
+        ) {
+          let low = options.minY;
+          let high = options.maxY;
+          while (high - low > 1) {
+            const candidate = Math.floor((low + high) / 2);
+            if (density.compute({ x, y: candidate, z }) > options.threshold) low = candidate;
+            else high = candidate;
+          }
+          value = low;
+          surfaceHits += 1;
         } else {
           value = options.minY;
           if (top > options.threshold) {
