@@ -1,0 +1,12 @@
+{
+  "name": "density-lens",
+  "version": "0.1.0",
+  "description": "",
+  "bin": {
+    "density-lens": "./bin/density-lens.mjs"
+  },
+  "type": "module",
+  "dependencies": {
+    "deepslate": "^0.27.1"
+  }
+}
