@@ -1,12 +1,13 @@
 {
   "name": "density-lens",
   "version": "0.1.0",
-  "description": "",
+  "description": "Render Minecraft density functions as grayscale maps",
   "bin": {
     "density-lens": "./bin/density-lens.mjs"
   },
   "type": "module",
   "dependencies": {
-    "deepslate": "^0.27.1"
+    "deepslate": "^0.27.1",
+    "pngjs": "^7.0.0"
   }
 }
