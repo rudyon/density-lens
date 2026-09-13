@@ -35,6 +35,7 @@ Options:
   --min-y <block>         Lowest Y searched by density mode (default: -64)
   --max-y <block>         Highest Y searched by density mode (default: 320)
   --y-step <blocks>       Vertical search step for density mode (default: 4)
+  --sea-level <block>     Tint heightmap pixels below this Y blue
   --threshold <value>     Density considered solid (default: 0)
   --seed <integer>        Noise seed (default: 0)
   --help                  Show this help
@@ -63,6 +64,7 @@ function parseArgs(argv) {
     minY: -64,
     maxY: 320,
     yStep: 4,
+    seaLevel: null,
     threshold: 0,
     seed: 0n,
     xzScale: 1,
@@ -85,6 +87,7 @@ function parseArgs(argv) {
     ["--min-y", "minY"],
     ["--max-y", "maxY"],
     ["--y-step", "yStep"],
+    ["--sea-level", "seaLevel"],
     ["--threshold", "threshold"],
     ["--seed", "seed"],
   ]);
@@ -359,9 +362,10 @@ function render(density, options) {
       Math.min(255, Math.round(((values[i] - min) / span) * 255)),
     );
     const pixel = i * 4;
-    png.data[pixel] = gray;
-    png.data[pixel + 1] = gray;
-    png.data[pixel + 2] = gray;
+    const underwater = options.mode === "density" && options.seaLevel !== null && values[i] < options.seaLevel;
+    png.data[pixel] = underwater ? Math.round(gray * 0.35) : gray;
+    png.data[pixel + 1] = underwater ? Math.round(gray * 0.55) : gray;
+    png.data[pixel + 2] = underwater ? Math.max(gray, 160) : gray;
     png.data[pixel + 3] = 255;
   }
   return { png, min, max, surfaceHits };
