@@ -12,6 +12,7 @@ import {
   WorldgenRegistries,
 } from "deepslate";
 import { XoroshiroRandom } from "deepslate/math";
+import { CubicSpline } from "deepslate/math";
 
 const usage = `Usage: density-lens <density-function.json> [options]
 
@@ -30,7 +31,9 @@ Options:
   --y-scale <value>       Y scale for direct noise files (default: 1)
   --origin-x <block>      World X at the image center (default: 0)
   --origin-z <block>      World Z at the image center (default: 0)
-  --mode <density|noise>  Density heightmap or noise map (default: auto)
+  --mode <density|noise|splines>
+                          Density heightmap, noise map, or tiled splines (default: auto)
+  --spline-columns <n>    Tiles per row in splines mode (default: 4)
   --y <block>             Y coordinate for noise mode (default: 0)
   --min-y <block>         Lowest Y searched by density mode (default: -64)
   --max-y <block>         Highest Y searched by density mode (default: 320)
@@ -60,6 +63,7 @@ function parseArgs(argv) {
     originX: 0,
     originZ: 0,
     mode: "auto",
+    splineColumns: 4,
     y: 0,
     minY: -64,
     maxY: 320,
@@ -83,6 +87,7 @@ function parseArgs(argv) {
     ["--origin-x", "originX"],
     ["--origin-z", "originZ"],
     ["--mode", "mode"],
+    ["--spline-columns", "splineColumns"],
     ["--y", "y"],
     ["--min-y", "minY"],
     ["--max-y", "maxY"],
@@ -101,9 +106,9 @@ function parseArgs(argv) {
     else options[key] = Number(value);
   }
   if (!fs.existsSync(input)) throw new Error(`input file not found: ${input}`);
-  if (!["auto", "density", "noise"].includes(options.mode))
-    throw new Error("--mode must be density or noise");
-  for (const key of ["width", "height", "scale", "xzScale", "yScale", "yStep"])
+  if (!["auto", "density", "noise", "splines"].includes(options.mode))
+    throw new Error("--mode must be density, noise, or splines");
+  for (const key of ["width", "height", "scale", "xzScale", "yScale", "yStep", "splineColumns"])
     if (!Number.isFinite(options[key]) || options[key] <= 0)
       throw new Error(`--${key} must be positive`);
   return { input, options };
@@ -284,6 +289,109 @@ function createGradientHeightModel(density, options) {
   };
 }
 
+function densityStructureKey(density) {
+  if (density instanceof DensityFunction.Constant) return ["constant", density.value];
+  if (density instanceof DensityFunction.HolderHolder) return ["holder", density.holder.key()?.toString() ?? "<anonymous>"];
+  if (density instanceof DensityFunction.Binary) return ["binary", density.type, densityStructureKey(density.left), densityStructureKey(density.right)];
+  if (density instanceof DensityFunction.Unary) return ["unary", density.type, densityStructureKey(density.input)];
+  if (density instanceof DensityFunction.NoiseFunction) return ["noise", density.noise.key()?.toString() ?? "<anonymous>", density.xzScale, density.yScale];
+  return [density.constructor.name];
+}
+
+function splineStructureKey(spline) {
+  if (spline instanceof CubicSpline.Constant) return ["constant", spline.value];
+  if (spline instanceof CubicSpline.MultiPoint) {
+    return [
+      "multi",
+      densityStructureKey(spline.coordinate),
+      spline.locations,
+      spline.derivatives,
+      spline.values.map(splineStructureKey),
+    ];
+  }
+  return [spline.constructor.name];
+}
+
+function collectSplines(density) {
+  const splines = [];
+  const seen = new Set();
+  density.mapAll({
+    apply(node) {
+      if (node instanceof DensityFunction.Spline) {
+        const key = JSON.stringify(splineStructureKey(node.spline));
+        if (!seen.has(key)) {
+          seen.add(key);
+          splines.push(node.spline);
+        }
+      }
+      return node;
+    },
+  });
+  return splines;
+}
+
+function renderSplines(density, options) {
+  const splines = collectSplines(density);
+  if (splines.length === 0) throw new Error("density function contains no splines");
+  const tileSize = 124;
+  const columns = Math.min(options.splineColumns, splines.length);
+  const rows = Math.ceil(splines.length / columns);
+  const png = new PNG({ width: columns * tileSize, height: rows * tileSize });
+  png.data.fill(255);
+  const setPixel = (x, y, value) => {
+    if (x < 0 || y < 0 || x >= png.width || y >= png.height) return;
+    const index = (y * png.width + x) * 4;
+    png.data[index] = value;
+    png.data[index + 1] = value;
+    png.data[index + 2] = value;
+    png.data[index + 3] = 255;
+  };
+  const line = (x0, y0, x1, y1) => {
+    let dx = Math.abs(x1 - x0);
+    let sx = x0 < x1 ? 1 : -1;
+    let dy = -Math.abs(y1 - y0);
+    let sy = y0 < y1 ? 1 : -1;
+    let error = dx + dy;
+    while (true) {
+      setPixel(x0, y0, 0);
+      if (x0 === x1 && y0 === y1) break;
+      const twice = 2 * error;
+      if (twice >= dy) { error += dy; x0 += sx; }
+      if (twice <= dx) { error += dx; y0 += sy; }
+    }
+  };
+  splines.forEach((spline, splineIndex) => {
+    const tileX = (splineIndex % columns) * tileSize;
+    const tileY = Math.floor(splineIndex / columns) * tileSize;
+    const isMultiPoint = spline instanceof CubicSpline.MultiPoint;
+    const minX = isMultiPoint && spline.locations.length > 0 ? spline.locations[0] : -1;
+    const maxX = isMultiPoint && spline.locations.length > 0 ? spline.locations[spline.locations.length - 1] : 1;
+    const range = spline.range();
+    let minY = Number.isFinite(range.min) ? range.min : Infinity;
+    let maxY = Number.isFinite(range.max) ? range.max : -Infinity;
+    const samples = [];
+    for (let i = 0; i < tileSize; i += 1) {
+      const input = minX + (maxX - minX) * i / (tileSize - 1 || 1);
+      let sampleSpline = spline;
+      if (isMultiPoint) {
+        sampleSpline = new CubicSpline.MultiPoint(new CubicSpline.Constant(input), spline.locations, spline.values, spline.derivatives);
+      }
+      const value = sampleSpline.compute({ x: 0, y: 0, z: 0 });
+      samples.push(value);
+      if (!Number.isFinite(minY)) minY = Math.min(minY, value);
+      if (!Number.isFinite(maxY)) maxY = Math.max(maxY, value);
+    }
+    if (!Number.isFinite(minY) || !Number.isFinite(maxY)) { minY = -1; maxY = 1; }
+    const span = maxY - minY || 1;
+    for (let i = 1; i < samples.length; i += 1) {
+      const y0 = tileY + Math.max(0, Math.min(tileSize - 1, Math.round((maxY - samples[i - 1]) / span * (tileSize - 1))));
+      const y1 = tileY + Math.max(0, Math.min(tileSize - 1, Math.round((maxY - samples[i]) / span * (tileSize - 1))));
+      line(tileX + i - 1, y0, tileX + i, y1);
+    }
+  });
+  return { png, count: splines.length, width: columns * tileSize, height: rows * tileSize };
+}
+
 function render(density, options) {
   const values = new Float64Array(options.width * options.height);
   let min = Infinity;
@@ -403,6 +511,18 @@ try {
     ? new Set([loaded.id.toString()])
     : new Set();
   const density = bindNoise(parsed, options.seed, activeReferences);
+  if (options.mode === "splines" && loaded.kind === "noise") {
+    throw new Error("splines mode requires a density-function input");
+  }
+  if (options.mode === "splines") {
+    const result = renderSplines(density, options);
+    const output = path.resolve(options.output);
+    fs.writeFileSync(output, PNG.sync.write(result.png));
+    console.log(`Rendered ${input}`);
+    console.log(`  mode=splines count=${result.count} tile=124x124 size=${result.width}x${result.height}`);
+    console.log(`  wrote ${output}`);
+    process.exit(0);
+  }
   const { png, min, max, surfaceHits } = render(density, options);
   const output = path.resolve(options.output);
   fs.writeFileSync(output, PNG.sync.write(png));
